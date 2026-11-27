@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Fetch V2Ray/Xray configs per country from v2nodes.com, test connectivity and
-Google Gemini accessibility through xray-core, and save working configs for v2rayNG.
+Fetch V2Ray/Xray configs per country from v2nodes.com, test connectivity,
+egress country, HTTP Gemini response, and real Chromium-rendered Gemini page
+through xray-core, then save working configs for v2rayNG.
 """
 
 from __future__ import annotations
 
 import base64
 import concurrent.futures
+import html as html_lib
 import json
 import os
 import queue
@@ -24,16 +26,30 @@ from typing import Any
 
 import requests
 
+try:
+    from playwright.sync_api import sync_playwright
+
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 V2NODES_HOME_URL = "https://www.v2nodes.com/"
 V2NODES_COUNTRY_SUB_TEMPLATE = (
     "https://www.v2nodes.com/subscriptions/country/{country}/?key={key}"
 )
-CONNECTIVITY_CHECK_URL = "https://www.gstatic.com/generate_204"
+TRACE_CHECK_URL = "https://cloudflare.com/cdn-cgi/trace"
 GEMINI_CHECK_URL = "https://gemini.google.com/app"
 
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
+BROWSER_WORKERS = int(os.getenv("BROWSER_WORKERS", "4"))
+USE_BROWSER_VERIFY = os.getenv("USE_BROWSER_VERIFY", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "8"))
 GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "12"))
+BROWSER_TIMEOUT_MS = int(os.getenv("BROWSER_TIMEOUT_MS", "20000"))
 XRAY_STARTUP_TIMEOUT = float(os.getenv("XRAY_STARTUP_TIMEOUT", "3.0"))
 COUNTRY_REQUEST_DELAY = float(os.getenv("COUNTRY_REQUEST_DELAY", "0.25"))
 BASE_PORT = int(os.getenv("BASE_PORT", "20000"))
@@ -48,6 +64,12 @@ DEFAULT_COUNTRIES = (
     "no", "pl", "ru", "sa", "sg", "za", "kr", "es", "se", "ch",
     "tr", "th", "ua", "ae", "gb", "us", "vn",
 )
+
+# Exit countries where Google Gemini is known to be unsupported
+GEMINI_BLOCKED_COUNTRIES = {
+    "AF", "BY", "CF", "CN", "CU", "ER", "HK", "IR", "KP", "LY",
+    "MM", "MO", "RU", "SD", "SO", "SS", "SY", "TM", "VE", "YE",
+}
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -81,16 +103,19 @@ SUPPORTED_SS_METHODS = {
 }
 
 GEMINI_BLOCK_PHRASES = (
-    "gemini isn't currently supported in your country",
-    "gemini is not currently supported in your country",
+    "currently supported in your country",
+    "isn't currently supported in your country",
+    "is not currently supported in your country",
     "isn't available in your country",
     "not available in your country",
     "not supported in your country",
-    "403. that’s an error",
+    "country isn't currently supported",
+    "stay tuned!",
     "403. that's an error",
     "your client does not have permission",
     "unusual traffic from your computer network",
     "our systems have detected unusual traffic",
+    "support.google.com/gemini/answer/13575153",
 )
 
 GEMINI_BLOCK_URL_TOKENS = (
@@ -99,7 +124,21 @@ GEMINI_BLOCK_URL_TOKENS = (
     "/unsupported",
     "not-available",
     "unavailable",
+    "/faq",
 )
+
+
+def normalize_text_for_check(raw: str) -> str:
+    """Normalize HTML entities, JS unicode escapes, and curly apostrophes."""
+    text = raw.replace("\\u2019", "'").replace("\\u2018", "'").replace("\\u0027", "'")
+    text = html_lib.unescape(text)
+    text = (
+        text.replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("\u2032", "'")
+        .replace("`", "'")
+    )
+    return text.lower()
 
 
 def decode_base64_str(data: str) -> str:
@@ -248,6 +287,16 @@ def fetch_v2nodes_configs() -> list[str]:
         f"countries: {len(all_configs)}"
     )
     return all_configs
+
+
+def parse_trace_country(trace_text: str) -> str | None:
+    """Extract the 2-letter egress country code from Cloudflare cdn-cgi/trace."""
+    for line in trace_text.splitlines():
+        if line.startswith("loc="):
+            code = line.split("=", 1)[1].strip().upper()
+            if len(code) == 2:
+                return code
+    return None
 
 
 def build_stream_settings(
@@ -559,61 +608,96 @@ def wait_for_port(
     return False
 
 
-def is_gemini_accessible(resp: requests.Response) -> bool:
+def is_gemini_content_accessible(
+    status_code: int,
+    final_url: str,
+    body_text: str,
+) -> bool:
     """Verify that Gemini loaded cleanly without 403, CAPTCHA, or region errors."""
-    if resp.status_code != 200:
+    if status_code != 200:
         return False
 
-    final_url = resp.url.lower()
-    if any(token in final_url for token in GEMINI_BLOCK_URL_TOKENS):
+    url_lower = final_url.lower()
+    if any(token in url_lower for token in GEMINI_BLOCK_URL_TOKENS):
         return False
-    if "gemini.google.com" not in final_url:
+    if "gemini.google.com" not in url_lower:
         return False
 
-    body = resp.text.lower()
-    if any(phrase in body for phrase in GEMINI_BLOCK_PHRASES):
+    normalized = normalize_text_for_check(body_text)
+    if any(phrase in normalized for phrase in GEMINI_BLOCK_PHRASES):
         return False
 
     return True
 
 
-def test_config(
+def start_xray_process(
+    outbound: dict[str, Any],
+    port: int,
+    xray_bin: str,
+) -> tuple[subprocess.Popen[bytes] | None, str | None]:
+    """Start a temporary Xray process bound to 127.0.0.1:port."""
+    xray_cfg = build_xray_config(outbound, port)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".json",
+        delete=False,
+        encoding="utf-8",
+    ) as tmp:
+        json.dump(xray_cfg, tmp)
+        cfg_path = tmp.name
+
+    proc = subprocess.Popen(
+        [xray_bin, "run", "-c", cfg_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if not wait_for_port(port, proc):
+        stop_xray_process(proc, cfg_path)
+        return (None, None)
+    return (proc, cfg_path)
+
+
+def stop_xray_process(
+    proc: subprocess.Popen[bytes] | None,
+    cfg_path: str | None,
+) -> None:
+    """Terminate an Xray process and remove its temporary config file."""
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+    if cfg_path and os.path.exists(cfg_path):
+        try:
+            os.remove(cfg_path)
+        except OSError:
+            pass
+
+
+def test_config_http(
     uri: str,
     port_queue: queue.Queue[int],
     xray_bin: str,
 ) -> tuple[str, float | None, bool]:
     """
-    Test a single config in two stages:
-    1. Basic internet connectivity via gstatic generate_204.
-    2. Google Gemini accessibility without 403 or region restrictions.
-    Returns (uri, latency_ms_or_None, gemini_ok).
+    Fast HTTP screening in two stages:
+    1. Connectivity and egress country check via cloudflare.com/cdn-cgi/trace.
+    2. HTTP check against gemini.google.com/app for 403 / region messages.
+    Returns (uri, latency_ms_or_None, http_gemini_ok).
     """
     outbound = parse_uri_to_outbound(uri)
     if outbound is None:
         return (uri, None, False)
 
     port = port_queue.get()
-    cfg_path: str | None = None
     proc: subprocess.Popen[bytes] | None = None
+    cfg_path: str | None = None
 
     try:
-        xray_cfg = build_xray_config(outbound, port)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".json",
-            delete=False,
-            encoding="utf-8",
-        ) as tmp:
-            json.dump(xray_cfg, tmp)
-            cfg_path = tmp.name
-
-        proc = subprocess.Popen(
-            [xray_bin, "run", "-c", cfg_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        if not wait_for_port(port, proc):
+        proc, cfg_path = start_xray_process(outbound, port, xray_bin)
+        if proc is None:
             return (uri, None, False)
 
         proxies = {
@@ -621,20 +705,24 @@ def test_config(
             "https": f"socks5h://127.0.0.1:{port}",
         }
 
-        # Stage 1: Connectivity test
+        # Stage 1: Connectivity + egress country check
         start_time = time.monotonic()
-        conn_resp = requests.get(
-            CONNECTIVITY_CHECK_URL,
+        trace_resp = requests.get(
+            TRACE_CHECK_URL,
             proxies=proxies,
             headers=BROWSER_HEADERS,
             timeout=CONNECT_TIMEOUT,
             allow_redirects=False,
         )
-        if conn_resp.status_code not in (200, 204):
+        if trace_resp.status_code != 200:
             return (uri, None, False)
         latency_ms = round((time.monotonic() - start_time) * 1000, 1)
 
-        # Stage 2: Google Gemini accessibility test
+        egress_country = parse_trace_country(trace_resp.text)
+        if egress_country in GEMINI_BLOCKED_COUNTRIES:
+            return (uri, latency_ms, False)
+
+        # Stage 2: HTTP check on Gemini
         gemini_resp = requests.get(
             GEMINI_CHECK_URL,
             proxies=proxies,
@@ -642,24 +730,88 @@ def test_config(
             timeout=GEMINI_TIMEOUT,
             allow_redirects=True,
         )
-        gemini_ok = is_gemini_accessible(gemini_resp)
-        return (uri, latency_ms, gemini_ok)
+        http_ok = is_gemini_content_accessible(
+            gemini_resp.status_code,
+            gemini_resp.url,
+            gemini_resp.text,
+        )
+        return (uri, latency_ms, http_ok)
 
     except Exception:
         return (uri, None, False)
     finally:
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
+        stop_xray_process(proc, cfg_path)
+        port_queue.put(port)
+
+
+def verify_config_in_browser(
+    uri: str,
+    latency_ms: float,
+    port_queue: queue.Queue[int],
+    xray_bin: str,
+) -> tuple[str, float, bool]:
+    """
+    Stage 3: Render gemini.google.com/app in real headless Chromium routed
+    strictly through the proxy (with remote DNS resolution) to catch
+    JS-rendered country restriction screens.
+    """
+    outbound = parse_uri_to_outbound(uri)
+    if outbound is None:
+        return (uri, latency_ms, False)
+
+    port = port_queue.get()
+    proc: subprocess.Popen[bytes] | None = None
+    cfg_path: str | None = None
+
+    try:
+        proc, cfg_path = start_xray_process(outbound, port, xray_bin)
+        if proc is None:
+            return (uri, latency_ms, False)
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                proxy={"server": f"socks5://127.0.0.1:{port}"},
+                args=[
+                    "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1",
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                ],
+            )
             try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=2)
-        if cfg_path and os.path.exists(cfg_path):
-            try:
-                os.remove(cfg_path)
-            except OSError:
-                pass
+                context = browser.new_context(
+                    locale="en-US",
+                    user_agent=BROWSER_HEADERS["User-Agent"],
+                )
+                page = context.new_page()
+                resp = page.goto(
+                    GEMINI_CHECK_URL,
+                    wait_until="domcontentloaded",
+                    timeout=BROWSER_TIMEOUT_MS,
+                )
+                if resp is None:
+                    return (uri, latency_ms, False)
+
+                # Wait briefly for client-side region redirect/render to settle
+                try:
+                    page.wait_for_load_state("networkidle", timeout=6000)
+                except Exception:
+                    page.wait_for_timeout(3000)
+
+                rendered_text = page.inner_text("body")
+                page_html = page.content()
+                ok = is_gemini_content_accessible(
+                    resp.status,
+                    page.url,
+                    f"{rendered_text}\n{page_html}",
+                )
+                return (uri, latency_ms, ok)
+            finally:
+                browser.close()
+    except Exception:
+        return (uri, latency_ms, False)
+    finally:
+        stop_xray_process(proc, cfg_path)
         port_queue.put(port)
 
 
@@ -700,35 +852,69 @@ def main() -> int:
         return 0
 
     port_queue: queue.Queue[int] = queue.Queue()
-    for offset in range(MAX_WORKERS):
+    for offset in range(max(MAX_WORKERS, BROWSER_WORKERS)):
         port_queue.put(BASE_PORT + offset)
 
     alive_count = 0
-    gemini_ready: list[tuple[str, float]] = []
+    http_candidates: list[tuple[str, float]] = []
 
     print(
-        f"[INFO] Testing {len(configs)} configs with {MAX_WORKERS} parallel workers..."
+        f"[INFO] Stage 1 & 2: Testing {len(configs)} configs with "
+        f"{MAX_WORKERS} parallel HTTP workers..."
     )
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [
-            executor.submit(test_config, uri, port_queue, xray_bin)
+            executor.submit(test_config_http, uri, port_queue, xray_bin)
             for uri in configs
         ]
         for idx, future in enumerate(concurrent.futures.as_completed(futures), start=1):
-            uri, latency_ms, gemini_ok = future.result()
+            uri, latency_ms, http_ok = future.result()
             if latency_ms is not None:
                 alive_count += 1
-                if gemini_ok:
-                    gemini_ready.append((uri, latency_ms))
+                if http_ok:
+                    http_candidates.append((uri, latency_ms))
             if idx % 25 == 0 or idx == len(configs):
                 print(
-                    f"[PROGRESS] {idx}/{len(configs)} tested | "
-                    f"Alive: {alive_count} | Gemini OK: {len(gemini_ready)}"
+                    f"[PROGRESS] HTTP {idx}/{len(configs)} | "
+                    f"Alive: {alive_count} | HTTP Gemini OK: {len(http_candidates)}"
                 )
 
+    gemini_ready: list[tuple[str, float]] = []
+    if USE_BROWSER_VERIFY and PLAYWRIGHT_AVAILABLE and http_candidates:
+        print(
+            f"[INFO] Stage 3: Verifying {len(http_candidates)} candidates in "
+            f"headless Chromium ({BROWSER_WORKERS} workers)..."
+        )
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=BROWSER_WORKERS
+        ) as executor:
+            b_futures = [
+                executor.submit(
+                    verify_config_in_browser, uri, latency_ms, port_queue, xray_bin
+                )
+                for uri, latency_ms in http_candidates
+            ]
+            for idx, future in enumerate(
+                concurrent.futures.as_completed(b_futures), start=1
+            ):
+                uri, latency_ms, browser_ok = future.result()
+                if browser_ok:
+                    gemini_ready.append((uri, latency_ms))
+                if idx % 10 == 0 or idx == len(http_candidates):
+                    print(
+                        f"[PROGRESS] Browser {idx}/{len(http_candidates)} | "
+                        f"Verified Gemini OK: {len(gemini_ready)}"
+                    )
+    else:
+        if USE_BROWSER_VERIFY and not PLAYWRIGHT_AVAILABLE:
+            print(
+                "[WARN] Playwright is not installed; skipping Stage 3 browser check."
+            )
+        gemini_ready = http_candidates
+
     print(
-        f"[SUMMARY] Total: {len(configs)} | "
-        f"Connected: {alive_count} | Gemini OK: {len(gemini_ready)}"
+        f"[SUMMARY] Total: {len(configs)} | Connected: {alive_count} | "
+        f"HTTP OK: {len(http_candidates)} | Verified Gemini OK: {len(gemini_ready)}"
     )
 
     if not gemini_ready and OUTPUT_SUB_FILE.exists():

@@ -13,7 +13,7 @@ permissions:
 jobs:
   update-subscription:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -24,8 +24,10 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Python dependencies
-        run: pip install --no-cache-dir "requests[socks]"
+      - name: Install Python dependencies and Chromium
+        run: |
+          pip install --no-cache-dir "requests[socks]" playwright
+          playwright install chromium
 
       - name: Download latest Xray-core
         run: |
@@ -39,6 +41,8 @@ jobs:
         env:
           XRAY_BIN: ${{ github.workspace }}/xray_bin/xray
           MAX_WORKERS: '20'
+          BROWSER_WORKERS: '4'
+          USE_BROWSER_VERIFY: '1'
         run: python update_sub.py
 
       - name: Commit and push updated subscription

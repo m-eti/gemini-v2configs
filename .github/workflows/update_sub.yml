@@ -1,0 +1,54 @@
+name: Update Gemini V2Ray Subscription
+
+on:
+  schedule:
+    # Runs daily at 00:00 Iran Standard Time (UTC+3:30 = 20:30 UTC).
+    # Change to '0 0 * * *' if you want 00:00 UTC instead.
+    - cron: '30 20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-subscription:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install --no-cache-dir "requests[socks]"
+
+      - name: Download latest Xray-core
+        run: |
+          mkdir -p xray_bin
+          curl -sSL -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -o xray.zip -d xray_bin
+          chmod +x xray_bin/xray
+          ./xray_bin/xray version
+
+      - name: Fetch and test configs
+        env:
+          XRAY_BIN: ${{ github.workspace }}/xray_bin/xray
+          MAX_WORKERS: '20'
+        run: python update_sub.py
+
+      - name: Commit and push updated subscription
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sub.txt sub_plain.txt
+          if git diff --staged --quiet; then
+            echo "No changes to subscription files."
+          else
+            git commit -m "chore: update Gemini-ready subscription ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            git push
+          fi
